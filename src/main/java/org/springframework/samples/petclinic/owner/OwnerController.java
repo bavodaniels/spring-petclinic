@@ -50,6 +50,8 @@ class OwnerController {
 
 	private static final String VIEWS_OWNER_CREATE_OR_UPDATE_FORM = "owners/createOrUpdateOwnerForm";
 
+	private static final int SINGLE_RESULT_COUNT = 1;
+
 	private final OwnerRepository owners;
 
 	public OwnerController(OwnerRepository owners) {
@@ -108,10 +110,10 @@ class OwnerController {
 			return "owners/findOwners";
 		}
 
-		if (ownersResults.getTotalElements() == 1) {
+		if (ownersResults.getTotalElements() == SINGLE_RESULT_COUNT) {
 			// 1 owner found
-			owner = ownersResults.iterator().next();
-			return "redirect:/owners/" + owner.getId();
+			Owner foundOwner = ownersResults.iterator().next();
+			return "redirect:/owners/" + foundOwner.getId();
 		}
 
 		// multiple owners found

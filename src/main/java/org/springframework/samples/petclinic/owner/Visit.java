@@ -46,6 +46,7 @@ public class Visit extends BaseEntity {
 	 * Creates a new instance of Visit for tomorrow
 	 */
 	public Visit() {
+		super();
 		this.date = LocalDate.now().plusDays(1);
 	}
 

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ruleset name="Petclinic ruleset"
+    xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.sourceforge.io/ruleset_2_0_0.xsd">
+
+  <description>
+    Locked-down PMD ruleset for spring-petclinic. Pulls in the bulk of PMD's
+    Java rule categories and only excludes rules that are either redundant
+    with spring-javaformat/checkstyle or produce excessive noise on a typical
+    Spring MVC/JPA codebase.
+  </description>
+
+  <rule ref="category/java/bestpractices.xml">
+    <!-- Spring constructor/field injection on many small beans is intentional, not a smell. -->
+    <exclude name="GuardLogStatement"/>
+    <exclude name="JUnitAssertionsShouldIncludeMessage"/>
+  </rule>
+
+  <rule ref="category/java/codestyle.xml">
+    <!-- Formatting/layout is already enforced by spring-javaformat and checkstyle. -->
+    <exclude name="OnlyOneReturn"/>
+    <exclude name="AtLeastOneConstructor"/>
+    <exclude name="LocalVariableCouldBeFinal"/>
+    <exclude name="MethodArgumentCouldBeFinal"/>
+    <exclude name="ShortVariable"/>
+    <exclude name="LongVariable"/>
+    <exclude name="CommentDefaultAccessModifier"/>
+    <exclude name="UnnecessaryConstructor"/>
+  </rule>
+
+  <rule ref="category/java/design.xml">
+    <!-- Spring MVC controllers/services naturally collect dependencies and request-handling methods. -->
+    <exclude name="LawOfDemeter"/>
+    <exclude name="LoosePackageCoupling"/>
+    <exclude name="TooManyMethods"/>
+    <!-- JPA entities and JavaBeans are plain getter/setter holders by design. -->
+    <exclude name="DataClass"/>
+  </rule>
+
+  <rule ref="category/java/documentation.xml">
+    <exclude name="CommentRequired"/>
+    <exclude name="CommentSize"/>
+  </rule>
+
+  <rule ref="category/java/errorprone.xml">
+    <!-- JPA entities implement Serializable only for Hibernate proxying, not wire
+         serialization, so a serialVersionUID carries no real value here. -->
+    <exclude name="BeanMembersShouldSerialize"/>
+    <exclude name="MissingSerialVersionUID"/>
+  </rule>
+
+  <rule ref="category/java/multithreading.xml"/>
+
+  <rule ref="category/java/performance.xml"/>
+
+  <rule ref="category/java/security.xml"/>
+
+</ruleset>
