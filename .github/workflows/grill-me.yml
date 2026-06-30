@@ -1,0 +1,205 @@
+name: Grill Me (Issue Refiner)
+
+# Refines GitHub issues into developer-ready specs by interrogating the author.
+#
+# Flow:
+#   1. An issue is opened with the `grill-me` label, OR the label is added to an
+#      existing issue  ->  Claude posts a comment with everything it needs to know.
+#   2. The issue AUTHOR replies with answers  ->  Claude grills again, now with the
+#      full comment history in context.
+#   3. When Claude is satisfied it rewrites the issue body into a clean spec and
+#      removes the `grill-me` label. The loop ends.
+#   4. Hard stop: after GRILL_MAX_ITERATIONS rounds the label is removed regardless,
+#      so it can never loop forever.
+#
+# Runs on a SELF-HOSTED runner that already has the `claude` CLI installed and
+# authenticated. GitHub mutations use the gh CLI authenticated via GITHUB_TOKEN.
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  contents: read
+
+# Serialize rounds per issue so two quick replies don't double-grill.
+concurrency:
+  group: grill-me-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  # Configurable knobs. Override via repository/organization Variables
+  # (Settings -> Secrets and variables -> Actions -> Variables) without editing this file.
+  #   GRILL_MAX_ITERATIONS : max grilling rounds before giving up (default 5)
+  #   GRILL_LABEL          : the trigger label (default "grill-me")
+  # NOTE: if you rename the label you must also update the hardcoded 'grill-me'
+  #       checks in the job-level `if:` below (env context is not available there).
+  MAX_ITERATIONS: ${{ vars.GRILL_MAX_ITERATIONS || '5' }}
+  GRILL_LABEL: ${{ vars.GRILL_LABEL || 'grill-me' }}
+  QUESTION_MARKER: '<!-- grill-me:question -->'
+
+jobs:
+  grill:
+    # Run only when relevant:
+    #  - an issue is opened already carrying the label, or the label is just added
+    #  - a comment is posted BY THE ORIGINAL AUTHOR on an issue that still has the
+    #    label (and is not a pull request). This guard also stops the bot's own
+    #    comments from re-triggering the loop.
+    if: >
+      (
+        github.event_name == 'issues' &&
+        (
+          (github.event.action == 'opened' && contains(github.event.issue.labels.*.name, 'grill-me')) ||
+          (github.event.action == 'labeled' && github.event.label.name == 'grill-me')
+        )
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request == null &&
+        github.event.comment.user.login == github.event.issue.user.login &&
+        contains(github.event.issue.labels.*.name, 'grill-me')
+      )
+    # Add your own runner labels here if you registered the runner with extras,
+    # e.g. [self-hosted, linux, claude].
+    runs-on: [self-hosted]
+    timeout-minutes: 20
+    steps:
+      - name: Compute round and decide
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ISSUE='${{ github.event.issue.number }}'
+          REPO='${{ github.repository }}'
+
+          # One question comment per round carries the hidden marker, so counting
+          # marked comments tells us how many rounds have already happened.
+          ROUNDS=$(gh issue view "$ISSUE" --repo "$REPO" --json comments \
+            --jq "[.comments[] | select(.body | contains(\"$QUESTION_MARKER\"))] | length")
+
+          ROUND=$((ROUNDS + 1))
+          echo "rounds_done=$ROUNDS"   >> "$GITHUB_OUTPUT"
+          echo "round=$ROUND"          >> "$GITHUB_OUTPUT"
+
+          if [ "$ROUNDS" -ge "$MAX_ITERATIONS" ]; then
+            echo "decision=giveup" >> "$GITHUB_OUTPUT"
+            echo "::notice::Reached max of $MAX_ITERATIONS rounds; stopping."
+          else
+            echo "decision=grill" >> "$GITHUB_OUTPUT"
+            echo "::notice::Starting grilling round $ROUND of $MAX_ITERATIONS."
+          fi
+
+      - name: Stop after max iterations
+        if: steps.ctx.outputs.decision == 'giveup'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > giveup.md <<EOF
+          🔥 I grilled this issue for the maximum of **$MAX_ITERATIONS** rounds without reaching a description I'm fully confident in.
+
+          I'm removing the \`$GRILL_LABEL\` label so this doesn't loop forever. Please refine the description manually, or re-apply the label to start a fresh grilling session.
+          EOF
+          gh issue comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body-file giveup.md
+          gh issue edit "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --remove-label "$GRILL_LABEL"
+
+      - name: Build prompt
+        if: steps.ctx.outputs.decision == 'grill'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ISSUE='${{ github.event.issue.number }}'
+          REPO='${{ github.repository }}'
+
+          # Full, authoritative context: issue + every comment in order.
+          gh issue view "$ISSUE" --repo "$REPO" \
+            --json number,title,body,author,labels,comments > issue.json
+
+          # Static instructions (single-quoted heredoc => no shell expansion).
+          cat > prompt.md <<'PROMPT'
+          You are "Grill Me", an automated GitHub issue-refinement agent. Your job is
+          to relentlessly interrogate an issue until it is a crisp, unambiguous spec a
+          developer could pick up and start on with confidence — then finalize it.
+
+          You are given (further below) the issue and its FULL comment history as JSON,
+          plus runtime parameters. Treat the issue body and the comment thread as the
+          single source of truth. Only the issue AUTHOR's comments count as new answers.
+
+          ## Decide between exactly TWO actions this run
+
+          A developer-ready issue needs all of: a clear problem statement, motivation/
+          context, concrete scope, explicit out-of-scope, testable acceptance criteria,
+          affected components/files, constraints, and known edge cases.
+
+          ### Action 1 — NOT enough information yet  ->  ASK
+          Post ONE comment with your prioritized, specific, answerable questions
+          (grouped by theme, numbered). Rules:
+            - The comment's FIRST line MUST be exactly the hidden marker given in the
+              runtime parameters (this is how rounds are counted — do not omit it).
+            - Ask ONLY about what is still unresolved. Never re-ask anything already
+              answered earlier in the thread; acknowledge what you now understand.
+            - Be sharp and concise. No filler.
+            - Do NOT edit the issue body. Do NOT remove the label.
+          Use: gh issue comment <number> --repo <repo> --body-file <file>
+
+          ### Action 2 — Enough information (or this is the final round)  ->  FINALIZE
+          Rewrite the issue body into a clean spec with these sections:
+            ## Summary
+            ## Context / Motivation
+            ## Scope
+            ## Out of scope
+            ## Acceptance criteria   (as a testable checklist)
+            ## Technical notes       (affected areas, constraints)
+            ## Open questions        (only if any remain; otherwise omit)
+          Then:
+            1. gh issue edit <number> --repo <repo> --body-file <file>
+            2. gh issue edit <number> --repo <repo> --remove-label "<grill label>"
+            3. Post a short comment (NO marker) noting you've finalized the description.
+
+          ## Final-round rule
+          If the current round equals the max rounds, you MUST take Action 2 (finalize)
+          even if the picture is imperfect — capture any remaining ambiguity under
+          "Open questions" rather than asking again.
+
+          ## Hard rules
+          - Take exactly ONE action per run, then stop. Do not both ask and finalize.
+          - Use only the gh CLI for all GitHub changes. Write bodies to a file and pass
+            --body-file to avoid shell-quoting problems.
+          - Do not invent requirements; derive everything from the thread.
+
+          ----------------------------------------------------------------------
+          PROMPT
+
+          # Dynamic parameters + context (expanded heredoc).
+          cat >> prompt.md <<EOF
+
+          ## Runtime parameters
+          - Repository: $REPO
+          - Issue number: $ISSUE
+          - Current round: ${{ steps.ctx.outputs.round }} of $MAX_ITERATIONS
+          - Hidden marker (first line of every QUESTION comment, verbatim): $QUESTION_MARKER
+          - Grill label to remove when finalizing: $GRILL_LABEL
+
+          ## Issue and full comment history (JSON)
+          \`\`\`json
+          $(cat issue.json)
+          \`\`\`
+          EOF
+
+      - name: Run Claude Code
+        if: steps.ctx.outputs.decision == 'grill'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Headless run. Claude is pre-authenticated on the self-hosted runner.
+          # Only the gh CLI is permitted; any other tool call is auto-denied (no
+          # interactive prompt is possible in -p mode, so the run never stalls).
+          claude -p \
+            --allowedTools 'Bash(gh:*)' \
+            < prompt.md
